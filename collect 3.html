@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Chens Life Data Collector</title>
+<style>
+:root{--bg:#0e1a2a;--fg:#eef3f8;--mut:#9fb2c6;--card:#162a42;--line:#27415f;--acc:#ffcc33;--ok:#7bd88f;--bad:#ff9a8a}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;padding:max(18px,env(safe-area-inset-top)) 16px max(32px,env(safe-area-inset-bottom))}
+main{max-width:560px;margin:0 auto}
+h1{font-size:26px;margin:8px 0 4px;letter-spacing:.5px}
+p{margin:6px 0 14px;color:var(--mut)}
+ul{list-style:none;margin:0 0 16px;padding:0;background:var(--card);border:1px solid var(--line);border-radius:14px}
+li{display:flex;gap:12px;align-items:flex-start;padding:11px 14px;border-top:1px solid var(--line)}
+li:first-child{border-top:0}
+.mk{width:22px;text-align:center;font-weight:700;color:var(--mut)}
+.tx{flex:1;min-width:0}
+.tx b{display:block;font-weight:600}
+.tx small{display:block;color:var(--mut);font-size:13px;word-break:break-word}
+li.run .mk{color:var(--acc)}li.ok .mk{color:var(--ok)}li.bad .mk{color:var(--bad)}li.bad small{color:var(--bad)}
+button{font:inherit;font-weight:700;border:0;border-radius:14px;padding:15px 18px;width:100%;margin:0 0 10px;background:var(--acc);color:#1b1b1b}
+button.alt{background:var(--card);color:var(--fg);border:1px solid var(--line)}
+button:disabled{opacity:.5}
+#fin{display:none}
+#sum{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:0 0 12px;font-size:14px;color:var(--mut);white-space:pre-line}
+a.dl{display:block;text-align:center;text-decoration:none;font-weight:700;border-radius:14px;padding:15px 18px;margin:0 0 10px;background:var(--ok);color:#10261a}
+</style></head>
+<body><main>
+<h1>Chens Life data collector</h1>
+<p>This page reads public map data (OpenStreetMap and the French IGN) for Chens-sur-Léman and all of Douvaine, then packs it into one file for the game. Keep this page open until every line has a tick.</p>
+<ul id="steps"></ul>
+<button id="go">Start</button>
+<div id="fin">
+ <div id="sum"></div>
+ <a id="dl" class="dl" href="#">Download the data file</a>
+ <button id="share" class="alt" hidden>Save or share the file</button>
+ <p>When it is saved, go back to the chat and attach the file <b id="fname"></b> to your next message.</p>
+</div>
+<noscript><p>This page needs JavaScript.</p></noscript>
+</main>
+<script>
+(function(){
+'use strict';
+var OLD={S:46.30993,W:6.25405,N:46.33005,E:6.28967};
+var FALLBACK={S:46.283,W:6.268,N:46.3301,E:6.338};
+var MIRRORS=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter'];
+var KEEP={'building':1,'building:levels':1,'height':1,'roof:shape':1,'name':1,'amenity':1,'shop':1,'entrance':1,'barrier':1,'highway':1,'leisure':1,'landuse':1,'natural':1,'waterway':1,'water':1,'power':1,'man_made':1,'wetland':1,'emergency':1,'tourism':1,'historic':1,'bridge':1,'tunnel':1,'layer':1,'surface':1};
+var STEPS=[
+ {id:'boundary',label:'Douvaine boundary'},
+ {id:'area',label:'Map area'},
+ {id:'buildings',label:'Buildings'},
+ {id:'roads',label:'Roads, paths and fences'},
+ {id:'land',label:'Fields, forests and details'},
+ {id:'lake',label:'Lake shore'},
+ {id:'bd',label:'Official building data (IGN)'},
+ {id:'elev',label:'Elevation (IGN)'}
+];
+var R={}, UI=null;
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function r6(v){return Math.round(v*1e6)/1e6}
+function host(u){try{return new URL(u).host}catch(e){return u}}
+function say(id,state,msg){if(UI)UI.status(id,state,msg||'')}
+
+function withTimeout(p,ms){var t;return Promise.race([p,new Promise(function(_,rej){t=setTimeout(function(){rej(new Error('timed out'))},ms)})]).finally(function(){clearTimeout(t)})}
+async function fetchJson(url,opts,ms){
+  var r=await withTimeout(fetch(url,opts||undefined),ms||150000);
+  if(!r.ok){var t='';try{t=(await r.text()).slice(0,160)}catch(e){}throw new Error('HTTP '+r.status+(t?': '+t.replace(/\s+/g,' '):''))}
+  return await r.json();
+}
+async function overpass(q,id,label){
+  var last=null,errs=[];
+  for(var round=0;round<2;round++){
+    for(var i=0;i<MIRRORS.length;i++){
+      var url=MIRRORS[i];
+      try{
+        say(id,'run',label+' ('+host(url)+')');
+        var j=await fetchJson(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)},200000);
+        if(j.remark&&/runtime error|timed out|out of memory/i.test(j.remark))throw new Error(j.remark);
+        return j;
+      }catch(e){last=new Error(host(url)+': '+(e&&e.message||e));errs.push(last.message);await sleep(round?6000:1200)}
+    }
+  }
+  throw new Error('All servers failed. '+errs.slice(0,3).join(' | ')+' (page address: '+(location.protocol+'//'+(location.host||'local file'))+')');
+}
+async function overpassTiles(mk,box,id,label,n){
+  n=n||2;var seen={},els=[],k=0,tot=n*n;
+  for(var i=0;i<n;i++)for(var j=0;j<n;j++){
+    k++;
+    var t={S:box.S+(box.N-box.S)*i/n,N:box.S+(box.N-box.S)*(i+1)/n,W:box.W+(box.E-box.W)*j/n,E:box.W+(box.E-box.W)*(j+1)/n};
+    var res=await overpass(mk(bb(t)),id,label+' part '+k+' of '+tot);
+    (res.elements||[]).forEach(function(e){var key=e.type+e.id;if(!seen[key]){seen[key]=1;els.push(e)}});
+    await sleep(800);
+  }
+  return {elements:els};
+}
+function tagsOf(t){var o={};if(t)for(var k in t)if(KEEP[k])o[k]=t[k];return o}
+function compact(els){
+  var ways=[],nodes=[];
+  for(var i=0;i<els.length;i++){var e=els[i];
+    if(e.type==='way'&&e.geometry){var g=[];for(var k=0;k<e.geometry.length;k++){var p=e.geometry[k];if(p)g.push(r6(p.lat),r6(p.lon))}if(g.length>=4)ways.push([e.id,tagsOf(e.tags),g])}
+    else if(e.type==='node'&&typeof e.lat==='number'){nodes.push([e.id,tagsOf(e.tags),r6(e.lat),r6(e.lon)])}
+  }
+  return {ways:ways,nodes:nodes};
+}
+function boundaryOf(rel){
+  var S=90,W=180,N=-90,E=-180,rings=[];
+  (rel.members||[]).forEach(function(m){
+    if(m.type!=='way'||!m.geometry)return;var g=[];
+    m.geometry.forEach(function(p){if(!p)return;S=Math.min(S,p.lat);N=Math.max(N,p.lat);W=Math.min(W,p.lon);E=Math.max(E,p.lon);g.push(r6(p.lat),r6(p.lon))});
+    rings.push({role:m.role||'',g:g});
+  });
+  return {S:S,W:W,N:N,E:E,rings:rings};
+}
+function snap(v,up){return (up?Math.ceil(v*1000):Math.floor(v*1000))/1000}
+function makeBox(c){
+  var m={S:c.S-0.0015,N:c.N+0.0015,W:c.W-0.002,E:c.E+0.002};
+  return {S:snap(Math.min(m.S,OLD.S),false),W:snap(Math.min(m.W,OLD.W),false),N:snap(Math.max(m.N,OLD.N),true),E:snap(Math.max(m.E,OLD.E),true)};
+}
+function bb(b){return b.S+','+b.W+','+b.N+','+b.E}
+
+function decodeBil(buf,w,h){
+  var n=w*h,dv=new DataView(buf);
+  function read(le){var a=new Float32Array(n);for(var i=0;i<n;i++)a[i]=dv.getFloat32(i*4,le);return a}
+  function score(a){var good=0,c=0,st=Math.max(1,(n/2000)|0);for(var i=0;i<n;i+=st){c++;if(a[i]>200&&a[i]<1500)good++}return good/c}
+  var a=read(true);if(score(a)<.5){var b=read(false);if(score(b)>score(a))a=b}
+  var mn=1e9,mx=-1e9,bad=0;
+  for(var i=0;i<n;i++){var v=a[i];if(!(v>-100&&v<5000)){a[i]=-9999;bad++}else{if(v<mn)mn=v;if(v>mx)mx=v}}
+  return {a:a,mn:mn,mx:mx,bad:bad};
+}
+function b64(f32){
+  var u=new Uint8Array(f32.length*4),dv=new DataView(u.buffer);
+  for(var i=0;i<f32.length;i++)dv.setFloat32(i*4,f32[i],true);
+  var s='';for(var k=0;k<u.length;k+=0x8000)s+=String.fromCharCode.apply(null,u.subarray(k,k+0x8000));
+  return btoa(s);
+}
+function dims(box,step,cap){
+  var kx=111320*Math.cos(46.32*Math.PI/180),kz=111132;
+  return {w:Math.min(cap,Math.max(8,Math.round((box.E-box.W)*kx/step))),h:Math.min(cap,Math.max(8,Math.round((box.N-box.S)*kz/step)))};
+}
+async function elevWms(box){
+  var d=dims(box,20,700);
+  var url='https://data.geopf.fr/wms-r/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=ELEVATION.ELEVATIONGRIDCOVERAGE&STYLES=&FORMAT='+encodeURIComponent('image/x-bil;bits=32')+'&CRS=EPSG:4326&BBOX='+bb(box)+'&WIDTH='+d.w+'&HEIGHT='+d.h;
+  var r=await withTimeout(fetch(url),120000);
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  var buf=await r.arrayBuffer();
+  if(buf.byteLength!==d.w*d.h*4){var t='';try{t=new TextDecoder().decode(buf.slice(0,200)).replace(/\s+/g,' ')}catch(e){}throw new Error('unexpected answer ('+buf.byteLength+' bytes) '+t)}
+  var x=decodeBil(buf,d.w,d.h);
+  if(x.bad>x.a.length*0.2||x.mx<200)throw new Error('elevation values look wrong');
+  return {src:'wms',w:d.w,h:d.h,bbox:[box.S,box.W,box.N,box.E],min:x.mn,max:x.mx,bad:x.bad,b64:b64(x.a)};
+}
+async function elevPoints(box,id){
+  var d=dims(box,100,120),nx=d.w,ny=d.h,lons=[],lats=[];
+  for(var j=0;j<ny;j++)for(var i=0;i<nx;i++){lats.push(r6(box.N-(box.N-box.S)*j/(ny-1)).toFixed(5));lons.push(r6(box.W+(box.E-box.W)*i/(nx-1)).toFixed(5))}
+  var out=new Float32Array(nx*ny),mn=1e9,mx=-1e9,bad=0;
+  for(var s=0;s<lons.length;s+=100){
+    say(id,'run','Elevation by points '+Math.min(100,Math.round(s/lons.length*100))+'%');
+    var url='https://data.geopf.fr/altimetrie/1.0/calcul/alti/rest/elevation.json?lon='+lons.slice(s,s+100).join('|')+'&lat='+lats.slice(s,s+100).join('|')+'&resource=ign_rge_alti_wld&zonly=true';
+    var j=null,err=null;for(var t=0;t<3&&!j;t++){try{j=await fetchJson(url,null,60000)}catch(e){err=e;await sleep(1500)}}
+    if(!j)throw err;
+    var el=j.elevations||[];
+    for(var k=0;k<el.length&&s+k<out.length;k++){var v=el[k];if(!(v>-100&&v<5000)){out[s+k]=-9999;bad++}else{out[s+k]=v;if(v<mn)mn=v;if(v>mx)mx=v}}
+  }
+  if(bad>out.length*0.2)throw new Error('too many missing elevation values');
+  return {src:'points',w:nx,h:ny,bbox:[box.S,box.W,box.N,box.E],min:mn,max:mx,bad:bad,b64:b64(out)};
+}
+var PROPS=['geometrie','hauteur','usage_1','nature','nombre_de_logements','nombre_d_etages','materiaux_des_murs','materiaux_de_la_toiture','construction_legere','altitude_minimale_sol'];
+async function getBD(box,id){
+  var got=new Map(),start=0,total=null,COUNT=1500;
+  function url(extra){return 'https://data.geopf.fr/wfs/ows?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=BDTOPO_V3:batiment&OUTPUTFORMAT=application/json&COUNT='+COUNT+'&STARTINDEX='+start+'&BBOX='+box.W+','+box.S+','+box.E+','+box.N+',EPSG:4326'+extra}
+  for(var guard=0;guard<40;guard++){
+    var j;
+    try{j=await fetchJson(url('&SORTBY=cleabs&PROPERTYNAME='+PROPS.join(',')),null,120000)}
+    catch(e1){try{j=await fetchJson(url(''),null,120000)}catch(e2){await sleep(2000);j=await fetchJson(url(''),null,120000)}}
+    var f=j.features||[];
+    if(total===null&&typeof j.numberMatched==='number')total=j.numberMatched;
+    f.forEach(function(x){got.set(x.id||('i'+got.size),x)});
+    start+=f.length;
+    say(id,'run','Buildings received: '+got.size+(total?' of '+total:''));
+    if(!f.length||(total!==null&&start>=total))break;
+  }
+  var out=[];
+  got.forEach(function(x){
+    var g=x.geometry,p=x.properties||{};if(!g)return;
+    var polys=g.type==='MultiPolygon'?g.coordinates:(g.type==='Polygon'?[g.coordinates]:[]);
+    var rings=[];polys.forEach(function(pg){var r=pg[0];if(!r)return;var a=[];for(var i=0;i<r.length-1;i++)a.push(r6(r[i][1]),r6(r[i][0]));if(a.length>=6)rings.push(a)});
+    if(!rings.length)return;
+    out.push({r:rings,h:p.hauteur==null?null:p.hauteur,u:p.usage_1||'',n:p.nature||'',l:p.nombre_de_logements||0,e:p.nombre_d_etages||0,wm:p.materiaux_des_murs==null?null:p.materiaux_des_murs,rm:p.materiaux_de_la_toiture==null?null:p.materiaux_de_la_toiture,ll:!!p.construction_legere,z:p.altitude_minimale_sol==null?null:p.altitude_minimale_sol});
+  });
+  return out;
+}
+
+var RUN={
+  boundary:async function(){
+    var fb={note:'boundary lookup unavailable, using the default Douvaine area',commune:{S:FALLBACK.S+0.0015,W:FALLBACK.W+0.002,N:FALLBACK.N-0.0015,E:FALLBACK.E-0.002,rings:[]}};
+    try{
+      var j=await overpass('[out:json][timeout:60];rel["boundary"="administrative"]["name"="Douvaine"]["admin_level"="8"](46.2,6.15,46.45,6.45);out geom;','boundary','Looking up the boundary');
+      var rel=(j.elements||[]).filter(function(e){return e.type==='relation'})[0];
+      var c=rel?boundaryOf(rel):null;
+      if(!c||!c.rings.length||c.N-c.S>0.12||c.E-c.W>0.2||c.N-c.S<0.005)return fb;
+      return {note:'found ('+c.rings.length+' boundary lines)',commune:c};
+    }catch(e){return fb}
+  },
+  area:async function(){
+    var box=makeBox(R.boundary.commune);
+    var km=function(a,b){return ((b-a)*111.2).toFixed(1)};
+    return {box:box,note:km(box.S,box.N)+' km by '+(((box.E-box.W)*111.32*Math.cos(46.32*Math.PI/180))).toFixed(1)+' km'};
+  },
+  buildings:async function(){
+    var b=R.area.box;
+    var j=await overpassTiles(function(x){return '[out:json][timeout:120][bbox:'+x+'];(way["building"];);out geom;'},b,'buildings','Downloading buildings',3);
+    var c=compact(j.elements||[]);
+    if(c.ways.length<50)throw new Error('only '+c.ways.length+' buildings came back');
+    return {c:c,note:c.ways.length+' buildings'};
+  },
+  roads:async function(){
+    var b=R.area.box;
+    var j=await overpassTiles(function(x){return '[out:json][timeout:120][bbox:'+x+'];(way["highway"];way["barrier"~"^(hedge|fence|wall|retaining_wall)$"];way["amenity"="parking"];);out geom;'},b,'roads','Downloading roads',2);
+    var c=compact(j.elements||[]);
+    if(c.ways.length<50)throw new Error('only '+c.ways.length+' roads came back');
+    return {c:c,note:c.ways.length+' roads, paths and fences'};
+  },
+  land:async function(){
+    var b=R.area.box;
+    var j=await overpassTiles(function(x){return '[out:json][timeout:120][bbox:'+x+'];(way["landuse"];way["natural"];way["leisure"];way["waterway"];node["natural"="tree"];node["highway"~"^(street_lamp|bus_stop)$"];node["amenity"~"^(bench|waste_basket|recycling)$"];node["emergency"="fire_hydrant"];node["entrance"];node["power"="pole"];);out geom;'},b,'land','Downloading land and details',2);
+    var c=compact(j.elements||[]);
+    return {c:c,note:c.ways.length+' areas, '+c.nodes.length+' points'};
+  },
+  lake:async function(){
+    var b=R.area.box,w=b.W+','+b.S;
+    var q='[out:json][timeout:90];rel["natural"="water"]["water"="lake"]["name"~"L[ée]man"]('+bb(b)+')->.l;way(r.l)('+bb(b)+');out geom;';
+    var j=await overpass(q,'lake','Downloading the lake shore');
+    var c=compact(j.elements||[]);
+    if(!c.ways.length)throw new Error('lake shore not found');
+    return {c:c,note:c.ways.length+' shore lines'};
+  },
+  bd:async function(){
+    var list=await getBD(R.area.box,'bd');
+    if(list.length<50)throw new Error('only '+list.length+' buildings came back');
+    var withH=list.filter(function(x){return x.h!=null}).length;
+    return {list:list,note:list.length+' buildings, '+withH+' with a measured height'};
+  },
+  elev:async function(){
+    var box=R.area.box,e=null,why='';
+    try{say('elev','run','Downloading the elevation grid');e=await elevWms(box)}catch(err){why=String(err&&err.message||err)}
+    if(!e){say('elev','run','Grid not available ('+why+'). Trying point by point');e=await elevPoints(box,'elev')}
+    return {e:e,note:e.w+' x '+e.h+' points, '+Math.round(e.min)+' to '+Math.round(e.max)+' m'+(e.src==='points'?' (point by point)':'')};
+  }
+};
+
+async function runAll(){
+  for(var i=0;i<STEPS.length;i++){
+    var s=STEPS[i];
+    if(R[s.id]!==undefined){continue}
+    say(s.id,'run','Starting');
+    try{R[s.id]=await RUN[s.id]();say(s.id,'ok',R[s.id].note||'')}
+    catch(e){R[s.id]=undefined;say(s.id,'bad',String(e&&e.message||e));return false}
+  }
+  return true;
+}
+function build(){
+  var o={v:1,made:new Date().toISOString(),box:R.area.box,commune:R.boundary.commune,
+    buildings:R.buildings.c,roads:R.roads.c,land:R.land.c,lake:R.lake.c.ways,bd:R.bd.list,elev:R.elev.e};
+  return JSON.stringify(o);
+}
+var api={runAll:runAll,build:build,R:R,decodeBil:decodeBil,makeBox:makeBox,compact:compact,setUI:function(u){UI=u}};
+if(typeof window!=='undefined'){window.__collector=api}else if(typeof globalThis!=='undefined'){globalThis.__collector=api}
+
+if(typeof document!=='undefined'&&document.getElementById('go')){
+  var ul=document.getElementById('steps'),rows={};
+  STEPS.forEach(function(s){
+    var li=document.createElement('li'),mk=document.createElement('div'),tx=document.createElement('div'),b=document.createElement('b'),sm=document.createElement('small');
+    mk.className='mk';mk.textContent='·';tx.className='tx';b.textContent=s.label;tx.appendChild(b);tx.appendChild(sm);li.appendChild(mk);li.appendChild(tx);ul.appendChild(li);rows[s.id]={li:li,mk:mk,sm:sm};
+  });
+  UI={status:function(id,state,msg){var r=rows[id];if(!r)return;r.li.className=state;r.mk.textContent=state==='ok'?'✓':state==='bad'?'✗':state==='run'?'…':'·';r.sm.textContent=msg}};
+  var go=document.getElementById('go'),busy=false;
+  go.addEventListener('click',async function(){
+    if(busy)return;busy=true;go.disabled=true;go.textContent='Working… keep this page open';
+    var ok=false;try{ok=await runAll()}catch(e){ok=false}
+    busy=false;go.disabled=false;
+    if(!ok){go.textContent='Try again';return}
+    go.style.display='none';
+    var text=build(),name='chens-douvaine-data.json',blob=new Blob([text],{type:'application/json'}),url=URL.createObjectURL(blob);
+    var dl=document.getElementById('dl');dl.href=url;dl.download=name;document.getElementById('fname').textContent=name;
+    document.getElementById('sum').textContent='File size: '+(blob.size/1048576).toFixed(1)+' MB\n'+STEPS.map(function(s){return s.label+': '+(R[s.id].note||'done')}).join('\n');
+    document.getElementById('fin').style.display='block';
+    try{var f=new File([blob],name,{type:'application/json'});if(navigator.canShare&&navigator.canShare({files:[f]})){var sh=document.getElementById('share');sh.hidden=false;sh.addEventListener('click',function(){navigator.share({files:[f]}).catch(function(){})})}}catch(e){}
+  });
+}
+})();
+</script></body></html>
