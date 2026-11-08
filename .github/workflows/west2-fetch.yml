@@ -1,0 +1,50 @@
+name: west2-fetch
+on:
+  push:
+    branches: [west2-fetch]
+    paths: [".github/workflows/west2-fetch.yml"]
+permissions:
+  contents: write
+jobs:
+  osm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        t:
+          - "a 6.20 46.2355 6.227 46.2625"
+          - "b 6.227 46.2355 6.254 46.2625"
+          - "c 6.20 46.2625 6.227 46.289"
+          - "d 6.227 46.2625 6.254 46.289"
+          - "e 6.20 46.289 6.227 46.31"
+          - "f 6.227 46.289 6.254 46.31"
+          - "g 6.20 46.31 6.254 46.331"
+          - "h 6.32 46.17 6.345 46.2355"
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd west2-fetch && bash fetch.sh ${{ matrix.t }}
+        timeout-minutes: 30
+        continue-on-error: true
+      - run: |
+          git config user.name bot
+          git config user.email bot@example.com
+          git add -A west2-fetch/data
+          git commit -m "data ${{ matrix.t }}" || true
+          for i in 1 2 3 4 5 6; do git pull --rebase -X theirs origin west2-fetch && git push origin HEAD:west2-fetch && break; sleep $((RANDOM%8+2)); done
+        if: always()
+  bd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd west2-fetch && bash bd.sh
+        timeout-minutes: 20
+        continue-on-error: true
+      - run: |
+          git config user.name bot
+          git config user.email bot@example.com
+          git add -A west2-fetch/data
+          git commit -m "data bd" || true
+          for i in 1 2 3 4 5 6; do git pull --rebase -X theirs origin west2-fetch && git push origin HEAD:west2-fetch && break; sleep $((RANDOM%8+2)); done
+        if: always()
